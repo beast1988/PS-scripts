@@ -1,0 +1,398 @@
+Add-Type -AssemblyName System.Windows.Forms
+
+Remove-Variable -Name * -ErrorAction SilentlyContinue
+Remove-Item -Path Function:\* -ErrorAction SilentlyContinue
+
+$defaultFolder = $null
+$requiredSpaceGB = 28
+
+function Select-FolderDialog {
+    $folderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
+    $folderBrowser.Description = "Vyberte adresář pro instalaci všech her"
+    $folderBrowser.ShowNewFolderButton = $true
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.TopMost = $true
+    $form.ShowInTaskbar = $false
+    $form.Opacity = 0
+    $form.Show()
+    $form.Activate()
+
+    if ($folderBrowser.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+        $form.Close()
+        return $folderBrowser.SelectedPath
+    } else {
+        $form.Close()
+        return $null
+    }
+}
+
+function Check-DiskSpace {
+    param (
+        [string]$path,
+        [int]$requiredSpaceGB
+    )
+
+    $drive = Get-PSDrive -Name (Get-Item -Path $path).PSDrive.Name
+    $freeSpaceGB = [math]::Round($drive.Free / 1GB, 2)
+
+    return $freeSpaceGB -ge $requiredSpaceGB
+}
+
+function Get-AvailableDriveLetter {
+    $usedLetters = Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Name
+    $allLetters = [char[]]([char]'C'..[char]'Z')
+    $availableLetters = $allLetters | Where-Object { $_ -notin $usedLetters }
+    return $availableLetters[0]
+}
+
+function Prompt-User {
+    $choice = [System.Windows.Forms.MessageBox]::Show("Na daném disku není dostatek místa. Chcete vybrat jiný disk?", "Nedostatek místa", [System.Windows.Forms.MessageBoxButtons]::YesNo)
+    return $choice -eq [System.Windows.Forms.DialogResult]::Yes
+}
+
+function Extract-ZipFile {
+    param (
+        [string]$zipFilePath,
+        [string]$destinationPath
+    )
+
+    $7zipPath  = Resolve-Path ".\7z.exe"
+    #$7zipPath = "C:\Program Files\7-Zip\7z.exe"
+    $arguments = "x `"$zipFilePath`" -o`"$destinationPath`" -y"
+
+    Start-Process -FilePath $7zipPath -ArgumentList $arguments -Wait -NoNewWindow
+}
+
+function Show-GameSelectionMenu {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Instalace LAN párty her"
+    $form.Size = New-Object System.Drawing.Size(300, 400)
+    $form.StartPosition = "CenterScreen"
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Které hry chcete instalovat:"
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point(10, 10)
+    $form.Controls.Add($label)
+
+    $tableLayoutPanel = New-Object System.Windows.Forms.TableLayoutPanel
+    $tableLayoutPanel.Location = New-Object System.Drawing.Point(10, 40)
+    $tableLayoutPanel.Size = New-Object System.Drawing.Size(260, 250)
+    $tableLayoutPanel.ColumnCount = 1
+    $tableLayoutPanel.RowCount = 6
+    $tableLayoutPanel.AutoSize = $true
+    $form.Controls.Add($tableLayoutPanel)
+
+    $games = @("Command & Conquer 3", "FlatOut 2", "Serious Sam", "Unreal Tournament 2004", "Call of Duty 4")
+    $checkboxes = @()
+
+    $installAllCheckbox = New-Object System.Windows.Forms.CheckBox
+    $installAllCheckbox.Text = "Instalovat všechny hry"
+    $installAllCheckbox.AutoSize = $true
+    $installAllCheckbox.Location = New-Object System.Drawing.Point(10, 40)
+    $installAllCheckbox.Add_CheckedChanged({
+        if ($installAllCheckbox.Checked) {
+            foreach ($checkbox in $checkboxes) {
+                $checkbox.Checked = $true
+                $checkbox.Enabled = $false
+            }
+        } else {
+            foreach ($checkbox in $checkboxes) {
+                $checkbox.Checked = $false
+                $checkbox.Enabled = $true
+            }
+        }
+    })
+    $tableLayoutPanel.Controls.Add($installAllCheckbox, 0, 0)
+
+    for ($i = 0; $i -lt $games.Length; $i++) {
+        $checkbox = New-Object System.Windows.Forms.CheckBox
+        $checkbox.Text = $games[$i]
+        $checkbox.AutoSize = $true
+        $tableLayoutPanel.Controls.Add($checkbox, 0, $i + 1)
+        $checkboxes += $checkbox
+    }
+
+    $button = New-Object System.Windows.Forms.Button
+    $button.Text = "Instalovat vybrané hry"
+    $button.Location = New-Object System.Drawing.Point(10, 300)
+    $button.Size = New-Object System.Drawing.Size(260, 30)
+    $button.Add_Click({
+        $selectedGames = $checkboxes | Where-Object { $_.Checked } | ForEach-Object { $_.Text }
+        if ($installAllCheckbox.Checked) {
+            $selectedGames = $games
+        }
+        Write-Host "POčet vybraných her: $($selectedGames.Count)"
+        Write-Host "Vybrané hry: $selectedGames"
+        $form.Tag = $selectedGames
+        $form.Close()
+    })
+    $form.Controls.Add($button)
+    $form.Add_FormClosing({
+        if ($_.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing) {
+            Write-Host "Form closed by user. Exiting script."
+            [System.Windows.Forms.Application]::Exit()
+            exit
+        }
+    })
+    $form.ShowDialog()
+    return $form.Tag
+}
+
+$selectedGames = Show-GameSelectionMenu
+
+do {
+    $defaultFolder = Select-FolderDialog
+
+    if ([string]::IsNullOrWhiteSpace($defaultFolder)) {
+        $defaultFolder = "C:\Hry"
+        if(-not(Test-Path -Path $defaultFolder)){
+            New-Item -Path $defaultFolder -ItemType Directory -Force
+            Write-Host "Výchozí cesta pro všechny hry je nastavena na: C:\Hry"
+        }
+    }
+
+    if (-not (Check-DiskSpace -path $defaultFolder -requiredSpaceGB $requiredSpaceGB)) {
+        Write-Host "Na daném disku není dostatek místa."
+        if (-not (Prompt-User)) {
+            Write-Host "Skript byl zrušen uživatelem."
+            exit
+        }
+        $defaultFolder = $null
+    }
+
+} while ($defaultFolder -eq $null)
+
+$desktopPath = [System.Environment]::GetFolderPath('Desktop')
+$gamesFolderPath = Join-Path -Path $desktopPath -ChildPath 'Games'
+if (-not (Test-Path -Path $gamesFolderPath)) {
+    New-Item -Path $gamesFolderPath -ItemType Directory -Force
+}
+
+if ($selectedGames -contains "Command & Conquer 3" -or $selectedGames.Count -eq 5) {
+    # Command & Conquer 3 install
+    $availableDriveLetter = Get-AvailableDriveLetter
+    $filePath = "$($availableDriveLetter):\setup.exe"
+    $ImagePath = Resolve-Path ".\Command&Conquer_3\CNC3_TiberiumWars109_by_HWMasters_DVD5.iso"
+
+    Mount-DiskImage -ImagePath $ImagePath
+    $disk = Get-DiskImage -ImagePath $ImagePath
+    $volume = Get-Volume -DiskImage $disk
+    Start-Sleep -Seconds 5
+
+    # Debugging output
+    Write-Host "Disk: $disk"
+    Write-Host "Volume: $volume"
+
+    # Check if DiskNumber is retrieved correctly
+    if ($volume.DiskNumber -ne $null) {
+        try {
+            $partition = Get-Partition -DiskNumber $volume.DiskNumber | Where-Object { $_.Type -eq 'Basic' }
+            $partition | Set-Partition -NewDriveLetter $availableDriveLetter -PartitionStyle MBR
+            Write-Host "Partition set successfully."
+        } catch {
+            Write-Host "Error setting partition: $_"
+        }
+    } else {
+        Write-Host "Error: DiskNumber is null. Unable to set partition."
+    }
+
+    Start-Sleep -Seconds 5
+
+    # Verify the drive letter assignment
+    $volume = Get-Volume -DriveLetter $availableDriveLetter
+    if ($volume -ne $null) {
+        Write-Host "Drive letter $availableDriveLetter assigned successfully."
+    } else {
+        Write-Host "Error: Drive letter $availableDriveLetter not assigned."
+    }
+
+    # Debugging output
+    Write-Host "Available Drive Letter: $availableDriveLetter"
+    Write-Host "File Path: $filePath"
+
+    # Start the installation process
+    try {
+        Start-Process -FilePath $filePath -ArgumentList "/verysilent /dir=$defaultFolder\C&C3\" -Wait
+        Write-Host "Installation started successfully."
+    } catch {
+        Write-Host "Error starting installation: $_"
+    }
+
+    $exePath = Join-Path -Path $defaultFolder -ChildPath "C&C3\CNC3.exe"
+    $shortcutPath = Join-Path -Path $gamesFolderPath -ChildPath 'C&C 3.lnk'
+
+    $WScriptShell = New-Object -ComObject WScript.Shell
+    $shortcut = $WScriptShell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $exePath
+    $shortcut.Save()
+
+    Dismount-DiskImage -ImagePath $ImagePath -Confirm
+    Write-Host "instalace Command & Conquer 3 dokončena."
+    $selectedCount = $selectedGames.Count
+        if ($selectedCount -lt 3){
+            exit
+        }
+
+    }
+
+if ($selectedGames -contains "FlatOut 2" -or $selectedGames.Count -eq 5) {
+    # FlatOut 2 install
+    $Fpath = Resolve-Path ".\FlatOut\"
+    $destinationPath = Join-Path -Path $defaultFolder -ChildPath "FlatOut_2"
+
+    # Create the destination directory
+    New-Item -Path $destinationPath -ItemType Directory -Force
+
+    # Use robocopy to copy files
+    $robocopyCommand = "robocopy `"$Fpath`" `"$destinationPath`" /E /COPYALL /R:3 /W:5"
+    Invoke-Expression $robocopyCommand
+
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Files copied successfully."
+    } else {
+        Write-Host "Error copying files. Robocopy exit code: $LASTEXITCODE"
+    }
+
+    $exePath = Join-Path -Path $defaultFolder -ChildPath "FlatOut_2\FlatOut2.exe"
+    $shortcutPath = Join-Path -Path $gamesFolderPath -ChildPath 'FlatOut 2.lnk'
+    $workingDirectory = Join-Path -Path $defaultFolder -ChildPath "FlatOut_2"
+
+    $WScriptShell = New-Object -ComObject WScript.Shell
+    $shortcut = $WScriptShell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $exePath
+    $shortcut.WorkingDirectory = $workingDirectory
+    $shortcut.Save()
+
+
+    Write-Host "instalace FlatOut 2 dokončena."
+    $selectedCount = $selectedGames.Count
+        if ($selectedCount -lt 3){
+            exit
+        }
+    }
+
+if ($selectedGames -contains "Serious Sam" -or $selectedGames.Count -eq 5) {
+    # Serious Sam install
+    $availableDriveLetter = Get-AvailableDriveLetter
+    $filePath = "$($availableDriveLetter):\cltse\Install\*"
+    $ImagePath = Resolve-Path ".\Serious_Sam\SamHDGold.iso"
+
+    Mount-DiskImage -ImagePath $ImagePath
+    $disk = Get-DiskImage -ImagePath $ImagePath
+    $volume = Get-Volume -DiskImage $disk
+    Start-Sleep -Seconds 5
+
+    # Debugging output
+    Write-Host "Disk: $disk"
+    Write-Host "Volume: $volume"
+
+    # Check if DiskNumber is retrieved correctly
+    if ($volume.DiskNumber -ne $null) {
+        try {
+            $partition = Get-Partition -DiskNumber $volume.DiskNumber | Where-Object { $_.Type -eq 'Basic' }
+            $partition | Set-Partition -NewDriveLetter $availableDriveLetter -PartitionStyle MBR
+            Write-Host "Partition set successfully."
+        } catch {
+            Write-Host "Error setting partition: $_"
+        }
+    } else {
+        Write-Host "Error: DiskNumber is null. Unable to set partition."
+    }
+
+    Start-Sleep -Seconds 5
+
+    # Verify the drive letter assignment
+    $volume = Get-Volume -DriveLetter $availableDriveLetter
+    if ($volume -ne $null) {
+        Write-Host "Drive letter $availableDriveLetter assigned successfully."
+    } else {
+        Write-Host "Error: Drive letter $availableDriveLetter not assigned."
+    }
+
+    # Debugging output
+    Write-Host "Available Drive Letter: $availableDriveLetter"
+    Write-Host "File Path: $filePath"
+
+    # Copy files and handle errors
+    try {
+        New-Item -Path (Join-Path -Path $defaultFolder -ChildPath "Serious_Sam_SE") -ItemType Directory -Force
+        Copy-Item -Path $filePath -Destination (Join-Path -Path $defaultFolder -ChildPath "Serious_Sam_SE") -Recurse -Force
+        Write-Host "Files copied successfully."
+    } catch {
+        Write-Host "Error copying files: $_"
+    }
+
+    Copy-Item -Path ".\Serious_Sam\Mapy\*.gro" -Destination (Join-Path -Path $defaultFolder -ChildPath "Serious_Sam_SE") -Force
+    Copy-Item -Path ".\Serious_Sam\Mapy\LevelsMP\DeathMatch" -Destination (Join-Path -Path $defaultFolder -ChildPath "Serious_Sam_SE\Levels\LevelsMP") -Force -Recurse
+
+    $zipFilePath = Resolve-Path ".\Serious_Sam\SeriousSam_WIdeScreen.zip"
+
+    Extract-ZipFile -zipFilePath $zipFilePath -destinationPath (Join-Path -Path $defaultFolder -ChildPath "Serious_Sam_SE") -Force -Recurse
+    
+    $exePath = Join-Path -Path $defaultFolder -ChildPath "Serious_Sam_SE\Bin\SeriousSam_Custom.exe"
+    $shortcutPath = Join-Path -Path $gamesFolderPath -ChildPath 'Serious Sam SE.lnk'
+
+    $WScriptShell = New-Object -ComObject WScript.Shell
+    $shortcut = $WScriptShell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $exePath
+    $shortcut.Save()
+
+    Dismount-DiskImage -ImagePath $ImagePath -Confirm
+    Write-Host "instalace Serious Sam dokončena."
+    $selectedCount = $selectedGames.Count
+        if ($selectedCount -lt 3){
+            exit
+        }
+    }
+
+if ($selectedGames -contains "Unreal Tournament 2004" -or $selectedGames.Count -eq 5) {
+    # Unreal Tournament 2004 install
+
+    New-Item -Path "$defaultFolder\UT_2004" -ItemType Directory -Force
+    Start-Process -FilePath ".\Unreal Tournament 2004\setup_ut2004.exe" -ArgumentList "/S /v/qn /dir=$defaultFolder\UT_2004" -Wait
+
+    # originál - $exePath = "$defaultFolder\UT_2004\System\UT2004.exe"
+    $exePath = Join-Path -Path $defaultFolder -ChildPath "UT_2004\System\UT2004.exe"
+    $shortcutPath = Join-Path -Path $gamesFolderPath -ChildPath 'UT 2004.lnk'
+
+    $WScriptShell = New-Object -ComObject WScript.Shell
+    $shortcut = $WScriptShell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $exePath
+    $shortcut.Save()
+
+    Write-Host "instalace Unreal Tournament 2004 dokončena."
+    $selectedCount = $selectedGames.Count
+        if ($selectedCount -lt 3){
+            exit
+        }
+    }
+
+if ($selectedGames -contains "Call of Duty 4" -or $selectedGames.Count -eq 5) {
+    # CoD MW4 Install
+
+    $zipFilePath = Resolve-Path ".\Call of Duty 4 - Modern Warfare_funkcni.zip"
+
+    Extract-ZipFile -zipFilePath $zipFilePath -destinationPath $defaultFolder
+
+    $exePath = Join-Path -Path $defaultFolder -ChildPath "Call of Duty 4 - Modern Warfare\iw3mp.exe"
+    $shortcutPath = Join-Path -Path $gamesFolderPath -ChildPath 'Call of Duty 4 - Modern Warfare.lnk'
+    $workingDirectory = Join-Path -Path $defaultFolder -ChildPath "Call of Duty 4 - Modern Warfare"
+    $parameters = '+set r_xassetnum "xmodel=1200" +set fs_game "mods/PeZBOT" +exec pezbot.cfg'
+
+    $WScriptShell = New-Object -ComObject WScript.Shell
+    $shortcut = $WScriptShell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $exePath
+    $shortcut.WorkingDirectory = $workingDirectory
+    $shortcut.Arguments = $parameters
+    $shortcut.Save()
+    Write-Host "instalace COD 4 dokončena."
+    $selectedCount = $selectedGames.Count
+        if ($selectedCount -lt 3){
+            exit
+        }
+    }
